@@ -1,0 +1,30 @@
+# Core Dependencies
+streamlit
+requests>=2.31.0
+tqdm
+yt-dlp
+
+# PyTorch with CUDA 12.4
+#--index-url https://download.pytorch.org/whl/cu124
+#torch
+#torchvision
+#torchaudio
+
+# ML/AI
+#transformers>=4.36.0
+#accelerate>=0.26.0
+#optimum>=1.16.1
+
+# Audio/Video Processing
+moviepy>=1.0.3
+ffmpeg-python>=0.2.0
+
+# Data Processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# API and Environment
+python-dotenv>=1.0.0
+
+# Optional Performance Optimizations
+#flash-attn>=2.3.3
