@@ -1,81 +1,1045 @@
-import warnings
+"""
+Video Transcription App with GPU Optimization
+Version: 2.1
+Author: Your Name
+License: MIT
+"""
+
+# Environment variables must be set before other imports
+import os
+os.environ.update({
+    "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
+    "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+    "CUDA_LAUNCH_BLOCKING": "1",
+    "NUMPY_EXPERIMENTAL_ARRAY_FUNCTION": "0"
+})
+
+# Streamlit import
 import streamlit as st
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+
+# Standard library imports
+import gc
+import json
+import logging
+import re
+import subprocess
+import tempfile
+import threading
+import warnings
+import concurrent.futures
+from datetime import datetime
+from pathlib import Path
+from queue import Queue
+from typing import Any, Dict, List, Optional, Union
+
+# Third party imports
 import torch
+from transformers import (
+    WhisperProcessor,
+    WhisperForConditionalGeneration,
+    pipeline
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Suppress warnings
+warnings.filterwarnings('ignore', message='.*torch.classes.*')
+warnings.filterwarnings('ignore', message='.*no running event loop.*')
+warnings.filterwarnings('ignore', message='.*attention mask.*')
+warnings.filterwarnings('ignore', message='.*forced_decoder_ids.*')
+warnings.filterwarnings('ignore', message='.*meta device.*')
+
+# Custom exceptions
+class TranscriptionError(Exception):
+    """Custom exception for transcription errors"""
+    pass
+
+class FFmpegNotFoundError(Exception):
+    """Custom exception for missing ffmpeg"""
+    pass
+
+class GPUError(Exception):
+    """Custom exception for GPU-related errors"""
+    pass
+
+# GPU initialization and management
+class GPUManager:
+    def __init__(self):
+        self.has_gpu = torch.cuda.is_available()
+        self.device = "cuda:0" if self.has_gpu else "cpu"
+        self.dtype = torch.float16 if self.has_gpu else torch.float32
+        
+        if self.has_gpu:
+            self.init_gpu()
+    
+    def init_gpu(self) -> None:
+        """Initialize GPU with optimal settings"""
+        try:
+            # Basic CUDA settings
+            torch.cuda.empty_cache()
+            torch.cuda.set_device(0)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.enabled = True
+
+            # Advanced optimizations for RTX 4090
+            if self.get_vram_gb() >= 24:  # RTX 4090 specific
+                torch.backends.cuda.enable_mem_efficient_sdp = True
+                if hasattr(torch.backends.cuda, 'memory_efficient_fusion'):
+                    torch.backends.cuda.memory_efficient_fusion = True
+                # Additional RTX 4090 optimizations
+                if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+                    torch.backends.cuda.enable_flash_sdp = True
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+
+            logger.info(f"GPU initialized: {torch.cuda.get_device_name(0)}")
+            
+        except Exception as e:
+            raise GPUError(f"GPU initialization failed: {str(e)}")
+    
+    def get_vram_gb(self) -> float:
+        """Get total VRAM in GB"""
+        return torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    
+    def get_info(self) -> Optional[Dict[str, Any]]:
+        """Get current GPU status and metrics"""
+        if not self.has_gpu:
+            return None
+
+        try:
+            info = {
+                "device_name": torch.cuda.get_device_name(0),
+                "total_memory": self.get_vram_gb(),
+                "allocated_memory": torch.cuda.memory_allocated() / (1024**3),
+                "cuda_version": torch.version.cuda,
+                "torch_version": torch.__version__
+            }
+
+            try:
+                smi = subprocess.check_output([
+                    'nvidia-smi',
+                    '--query-gpu=temperature.gpu,utilization.gpu,power.draw',
+                    '--format=csv,noheader,nounits'
+                ], text=True).strip().split(',')
+                
+                info.update({
+                    "temperature": float(smi[0]),
+                    "utilization": float(smi[1])
+                })
+            except:
+                pass
+
+            return info
+            
+        except Exception as e:
+            logger.warning(f"Error getting GPU info: {str(e)}")
+            return None
+    
+    def cleanup(self) -> None:
+        """Free GPU memory"""
+        if self.has_gpu:
+            torch.cuda.empty_cache()
+            gc.collect()
+
+# Initialize GPU manager
+gpu = GPUManager()
+
+class AudioProcessor:
+    def __init__(self):
+        self.ffmpeg_path = self._find_ffmpeg()
+    
+    def _find_ffmpeg(self) -> str:
+        """Find ffmpeg executable"""
+        common_locations = [
+            r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+            r"C:\ffmpeg\bin\ffmpeg.exe",
+            str(Path.home() / "AppData/Local/Programs/ffmpeg/bin/ffmpeg.exe")
+        ]
+        
+        from shutil import which
+        ffmpeg_path = which('ffmpeg')
+        if ffmpeg_path:
+            return ffmpeg_path
+            
+        for loc in common_locations:
+            if Path(loc).exists():
+                return str(Path(loc))
+                
+        raise FFmpegNotFoundError("ffmpeg not found. Please install ffmpeg and add it to PATH.")
+    
+    def extract_audio(self, video_path: Path) -> str:
+        """Extract audio from video or return path if already MP3"""
+        if str(video_path).lower().endswith('.mp3'):
+            return str(video_path)
+
+        try:
+            output_path = Path(tempfile.mktemp(suffix='.mp3'))
+            
+            input_path = str(video_path).replace('\\', '/')
+            output_path_str = str(output_path).replace('\\', '/')
+            
+            ffmpeg_cmd = f'"{self.ffmpeg_path}" -hide_banner -y -i "{input_path}" -q:a 0 -map 0:a "{output_path_str}"'
+            
+            process = subprocess.run(
+                ffmpeg_cmd,
+                shell=True,
+                capture_output=True,
+                check=True,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                raise ValueError("Audio extraction failed")
+                
+            return str(output_path)
+            
+        except Exception as e:
+            if 'output_path' in locals() and output_path.exists():
+                output_path.unlink()
+            raise RuntimeError(f"Audio extraction failed: {str(e)}")
+
+class TranscriptionManager:
+    def __init__(self, model_name: str, language: str):
+        self.model_name = model_name
+        self.language = language
+        self.audio_processor = AudioProcessor()
+        self.pipe = self._init_model()
+        
+    def _init_model(self):
+        """Initialize Whisper model with GPU optimization"""
+        try:
+            # Clear GPU memory first
+            if gpu.has_gpu:
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+
+            processor = WhisperProcessor.from_pretrained(self.model_name)
+            model = WhisperForConditionalGeneration.from_pretrained(
+                self.model_name,
+                torch_dtype=gpu.dtype,
+                use_safetensors=True,
+                low_cpu_mem_usage=True,
+                attn_implementation="sdpa"  # Use efficient attention
+            )
+
+            if gpu.has_gpu:
+                model.eval()
+                model = model.to(gpu.device)
+                # Enable memory efficient attention
+                model.config.use_cache = True
+
+            return pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                torch_dtype=gpu.dtype,
+                device=gpu.device if gpu.has_gpu else "cpu"
+            )
+        except Exception as e:
+            raise TranscriptionError(f"Model initialization failed: {str(e)}")
+    
+    def _get_params(self) -> dict:
+        """Get optimized transcription parameters"""
+        params = {
+            "batch_size": 16,
+            "chunk_length_s": 30,
+            "stride_length_s": 2,
+            "return_timestamps": True,  # Chunk-level timestamps (less memory intensive)
+            "generate_kwargs": {
+                "language": self.language,
+                "task": "transcribe"
+            }
+        }
+
+        if gpu.has_gpu and gpu.get_vram_gb() >= 24:  # RTX 4090 - Very conservative settings
+            params.update({
+                "batch_size": 8,  # Very small batch size to prevent memory issues
+                "chunk_length_s": 20,  # Smaller chunks
+                "stride_length_s": 2,  # Less overlap
+                "num_workers": 1  # Single worker
+            })
+
+        return params
+    
+    def format_transcript_with_timestamps(self, result: dict) -> str:
+        """Format transcript with timestamps"""
+        if 'chunks' not in result:
+            return result.get('text', '')
+
+        formatted_text = []
+        for chunk in result['chunks']:
+            if 'timestamp' in chunk and chunk['timestamp']:
+                start_time = chunk['timestamp'][0]
+                end_time = chunk['timestamp'][1]
+
+                # Format time as MM:SS or HH:MM:SS
+                if start_time >= 3600:
+                    start_str = f"{int(start_time//3600):02d}:{int((start_time%3600)//60):02d}:{int(start_time%60):02d}"
+                    end_str = f"{int(end_time//3600):02d}:{int((end_time%3600)//60):02d}:{int(end_time%60):02d}"
+                else:
+                    start_str = f"{int(start_time//60):02d}:{int(start_time%60):02d}"
+                    end_str = f"{int(end_time//60):02d}:{int(end_time%60):02d}"
+
+                formatted_text.append(f"[{start_str} - {end_str}] {chunk['text']}")
+            else:
+                formatted_text.append(chunk['text'])
+
+        return '\n\n'.join(formatted_text)
+
+    def transcribe(self, file_path: Path) -> dict:
+        """Transcribe audio file"""
+        try:
+            gpu.cleanup()
+
+            if not str(file_path).lower().endswith('.mp3'):
+                audio_path = self.audio_processor.extract_audio(file_path)
+            else:
+                audio_path = str(file_path)
+
+            try:
+                params = self._get_params()
+                result = self.pipe(audio_path, **params)
+
+                # Format transcript with timestamps
+                if 'chunks' in result:
+                    result['formatted_text'] = self.format_transcript_with_timestamps(result)
+                    result['text'] = result['formatted_text']
+
+                if audio_path != str(file_path):
+                    try:
+                        os.unlink(audio_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove temp file: {e}")
+
+                return result
+
+            except Exception as e:
+                raise TranscriptionError(f"Transcription failed: {str(e)}")
+
+        finally:
+            gpu.cleanup()
+
+# Initialize GPU
+has_gpu = gpu.has_gpu
+
+# Import ML components
+from transformers import (
+    WhisperProcessor,
+    WhisperForConditionalGeneration,
+    pipeline
+)
+
+class TranscriptionError(Exception):
+    """Custom exception for transcription errors"""
+    pass
+
+# Model initialization and parameter functions are handled by TranscriptionManager class
+
+def transcribe_audio(file_path: Path, model_name: str, language: str) -> dict:
+    """
+    Transcribe audio with optimized error handling and GPU monitoring
+    """
+    try:
+        # Initialize GPU if available
+        if has_gpu:
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # Log initial GPU state
+            info = get_gpu_info()
+            if info:
+                logger.info(f"Initial GPU Memory: {info['allocated_memory']:.1f}GB / {info['total_memory']:.1f}GB")
+        
+        # Convert video to audio if needed
+        if not str(file_path).lower().endswith('.mp3'):
+            audio_path = extract_audio(file_path)
+        else:
+            audio_path = str(file_path)
+        
+        try:
+            # Initialize model and get parameters
+            pipe = init_model(model_name)
+            params = get_transcription_params(language)
+            
+            # Process audio
+            result = pipe(audio_path, **params)
+            
+            # Cleanup temporary file
+            if audio_path != str(file_path):
+                try:
+                    os.unlink(audio_path)
+                except Exception as e:
+                    logger.warning(f"Failed to remove temp file: {e}")
+            
+            return result
+            
+        except Exception as e:
+            raise TranscriptionError(f"Transcription failed: {str(e)}")
+            
+    finally:
+        # Cleanup
+        if has_gpu:
+            torch.cuda.empty_cache()
+            gc.collect()
+
+class FFmpegNotFoundError(Exception):
+    """Custom exception for missing ffmpeg"""
+    pass
+
+def find_ffmpeg() -> str:
+    """Find ffmpeg executable in system PATH or common locations"""
+    common_locations = [
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        str(Path.home() / "AppData/Local/Programs/ffmpeg/bin/ffmpeg.exe")
+    ]
+    
+    # Check PATH first
+    from shutil import which
+    ffmpeg_path = which('ffmpeg')
+    if ffmpeg_path:
+        return ffmpeg_path
+        
+    # Check common locations
+    for loc in common_locations:
+        if Path(loc).exists():
+            return str(Path(loc))
+            
+    raise FFmpegNotFoundError("ffmpeg not found. Please install ffmpeg and add it to PATH.")
+
+def extract_audio(video_path: Path) -> str:
+    """Extract audio from video file or return path if already MP3"""
+    if str(video_path).lower().endswith('.mp3'):
+        return str(video_path)
+
+    try:
+        # Find ffmpeg
+        ffmpeg_exe = find_ffmpeg()
+        
+        # Create temporary output file
+        output_path = Path(tempfile.mktemp(suffix='.mp3'))
+        
+        # Normalize paths
+        input_path = str(video_path).replace('\\', '/')
+        output_path_str = str(output_path).replace('\\', '/')
+        
+        # Create ffmpeg command
+        ffmpeg_cmd = f'"{ffmpeg_exe}" -hide_banner -y -i "{input_path}" -q:a 0 -map 0:a "{output_path_str}"'
+        
+        # Run ffmpeg
+        process = subprocess.run(
+            ffmpeg_cmd,
+            shell=True,
+            capture_output=True,
+            check=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        if process.stderr:
+            logger.info(f"FFmpeg output:\n{process.stderr}")
+            
+        # Verify output
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise ValueError("Audio extraction failed")
+            
+        return str(output_path)
+        
+    except Exception as e:
+        if 'output_path' in locals() and output_path.exists():
+            output_path.unlink()
+        raise RuntimeError(f"Audio extraction failed: {str(e)}")
+
+def process_files(
+    files: List[Path],
+    model_name: str,
+    language: str,
+    skip_existing: bool = True
+) -> dict:
+    """Process multiple files with progress tracking"""
+
+    results = {}
+    progress = st.progress(0)
+    status = st.empty()
+
+    try:
+        # Filter existing files if requested
+        if skip_existing:
+            files = [f for f in files if not f.with_suffix('.txt').exists()]
+            
+        if not files:
+            st.info("No files to process")
+            return results
+            
+        # Process files
+        for i, file in enumerate(files):
+            try:
+                status.info(f"Processing: {file.name}")
+                
+                result = transcribe_audio(file, model_name, language)
+                results[file.name] = result
+                
+                # Save transcript
+                transcript_path = file.with_suffix('.txt')
+                with open(transcript_path, 'w', encoding='utf-8') as f:
+                    f.write(result['text'])
+                    
+                st.success(f"✓ Completed: {file.name}")
+                
+            except Exception as e:
+                st.error(f"Error processing {file.name}: {str(e)}")
+                
+            progress.progress((i + 1) / len(files))
+            
+        return results
+        
+    except Exception as e:
+        st.error(f"Processing error: {str(e)}")
+        return results
+
+# Initialize GPU - configuration is handled by GPUManager instance
+if gpu.has_gpu:
+    logger.info(f"GPU: {gpu.get_info()['device_name']}")
+
+def transcribe_audio(file_path: Path, model_name: str, language: str) -> dict:
+    """
+    Transcribe audio file using TranscriptionManager
+    """
+    try:
+        # Create transcription manager
+        manager = TranscriptionManager(model_name=model_name, language=language)
+        
+        # Log GPU state before processing
+        if gpu.has_gpu:
+            info = gpu.get_info()
+            if info:
+                logger.info(f"GPU Memory: {info['allocated_memory']:.1f}GB / {info['total_memory']:.1f}GB")
+        
+        # Process audio using manager
+        result = manager.transcribe(file_path)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Transcription error: {str(e)}")
+        raise
+
+def init_model(model_name: str):
+    """Initialize model by creating a temporary TranscriptionManager"""
+    manager = TranscriptionManager(model_name=model_name, language="auto")
+    return manager.pipe
+
+def get_transcription_params(language: str = "en") -> dict:
+    """Get optimized transcription parameters by creating a temporary TranscriptionManager"""
+    manager = TranscriptionManager(model_name="openai/whisper-large-v3", language=language)
+    return manager._get_params()
+
+# Suppress non-critical warnings
+warnings.filterwarnings('ignore', message='.*torch.classes.*')
+warnings.filterwarnings('ignore', message='.*no running event loop.*')
+warnings.filterwarnings('ignore', message='.*attention mask.*')
+warnings.filterwarnings('ignore', message='.*forced_decoder_ids.*')
+warnings.filterwarnings('ignore', message='.*meta device.*')
+
+# Import transformers components
+# Import remaining dependencies
+from transformers import pipeline
+from transformers.models.whisper import WhisperProcessor, WhisperForConditionalGeneration
 from pathlib import Path
 import tempfile
-import os
 import subprocess
 import time
+import re
 from datetime import datetime, timedelta
 import json
 import requests
+from functools import partial
+from queue import Queue, Empty
 from app0 import get_next_api_key, BASE_URL
 
-warnings.simplefilter(action='ignore', category=FutureWarning)
-warnings.filterwarnings('ignore', message='The attention mask is not set')
-warnings.filterwarnings('ignore', message='.*forced_decoder_ids.*')
-
 BASE_URL = "https://www.googleapis.com/youtube/v3"
+
+# Remove duplicate function - we'll use the one from GPUManager class
+
+def get_model_config():
+    """Get model configuration based on current GPU manager settings"""
+    config = {
+        "torch_dtype": gpu.dtype,
+        "device_map": gpu.device,
+        "use_safetensors": True,
+        "low_cpu_mem_usage": True,
+        "use_cache": True if torch.__version__ >= "2.0.0" else False
+    }
+    return config
+
+def get_whisper_settings(language: str = "en"):
+    """Get optimized Whisper model settings"""
+    settings = {
+        "model_config": get_model_config(),
+        "pipeline_settings": {
+            "device": gpu.device,
+            "framework": "pt",
+            "batch_size": 16,
+            "chunk_length_s": 30,
+            "stride_length_s": 2,
+            "num_workers": min(4, os.cpu_count() or 1) if gpu.has_gpu else 1
+        }
+    }
+    
+    if gpu.has_gpu and gpu.get_vram_gb() >= 24:  # RTX 4090 - Conservative
+        settings["pipeline_settings"].update({
+            "batch_size": 32 if language == "en" else 24,  # Conservative batch sizes
+            "chunk_length_s": 30,  # Standard chunk length
+            "stride_length_s": 3,  # Moderate overlap
+            "num_workers": min(2, os.cpu_count() or 1)  # Limit parallel workers
+        })
+    
+    return settings
+
+def transcribe_audio(audio_path, model_name, language, batch_size, chunk_length):
+    """Transcribe audio with enhanced error recovery and performance monitoring"""
+    retry_count = 0
+    max_retries = 3
+    last_error = None
+    monitor_thread = None
+
+    def start_gpu_monitoring():
+        if not torch.cuda.is_available():
+            return None, {}
+
+        perf_metrics = {
+            "initial_state": None,
+            "model_load": None,
+            "transcription": [],
+            "stage_timings": {
+                "model_load": 0,
+                "processing": 0,
+                "total": 0
+            },
+            "memory": {
+                "initial": 0,
+                "peak": 0,
+                "current": 0
+            },
+            "gpu": {
+                "max_util": 0,
+                "avg_util": 0,
+                "samples": [],
+                "power_samples": [],
+                "temp_samples": []
+            }
+        }
+
+        def periodic_monitor():
+            while not getattr(periodic_monitor, "stop", False):
+                metrics = get_gpu_info()
+                if metrics:
+                    perf_metrics["transcription"].append(metrics)
+                    
+                    # Alert on issues
+                    if metrics["temperature"] > 80:
+                        logger.warning(f"🌡️ High temperature: {metrics['temperature']}°C")
+                    if metrics["utilization"] > 95:
+                        logger.warning(f"⚡ High utilization: {metrics['utilization']}%")
+                time.sleep(0.1)
+
+        monitor_thread = threading.Thread(target=periodic_monitor)
+        monitor_thread.start()
+        return monitor_thread, perf_metrics
+
+    while retry_count < max_retries:
+        try:
+            # Initialize performance monitoring
+            start_time = time.time()
+            monitor_thread, perf_metrics = start_gpu_monitoring()
+
+            # Convert video to audio if needed
+            audio_file = extract_audio(audio_path)
+
+            # Initialize GPU
+            if torch.cuda.is_available():
+                # Basic memory management
+                torch.cuda.empty_cache()
+                gc.collect()
+
+                # Log GPU state
+                info = get_gpu_info()
+                if info:
+                    logger.info(f"""
+                    GPU Status:
+                    Memory: {info['allocated_memory']/1024:.1f}GB / {info['total_memory']/1024:.1f}GB
+                    """)
+
+            # Load model
+            processor = AutoProcessor.from_pretrained(model_name)
+            
+            st.info("Loading Whisper model...")
+            
+            # Create processor first
+            processor = WhisperProcessor.from_pretrained(model_name)
+            
+            # Configure GPU settings
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            
+            try:
+                # Load model with basic settings first
+                model = WhisperForConditionalGeneration.from_pretrained(
+                    model_name,
+                    torch_dtype=torch_dtype,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True
+                ).to(device)
+                
+                if torch.cuda.is_available():
+                    # Apply GPU optimizations
+                    model.eval()
+                    torch.cuda.empty_cache()
+                    
+                    # Enable efficient memory usage
+                    if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+                        torch.backends.cuda.enable_mem_efficient_sdp = True
+                
+                # Create optimized pipeline
+                pipe = pipeline(
+                    "automatic-speech-recognition",
+                    model=model,
+                    tokenizer=processor.tokenizer,
+                    feature_extractor=processor.feature_extractor,
+                    torch_dtype=torch_dtype,
+                    device=device
+                )
+                
+                st.success("✨ Model loaded successfully")
+                
+            except Exception as e:
+                st.error(f"Error loading model: {str(e)}")
+                raise
+
+            # Configure transcription parameters
+            transcribe_params = {
+                "batch_size": 16,  # Start with conservative batch size
+                "chunk_length_s": 30,
+                "stride_length_s": 2,
+                "return_timestamps": True,
+                "generate_kwargs": {
+                    "language": language,
+                    "task": "transcribe"
+                }
+            }
+            
+            if torch.cuda.is_available():
+                # Adjust batch size based on VRAM - RTX 4090 conservative
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                if vram_gb >= 24:  # RTX 4090
+                    transcribe_params.update({
+                        "batch_size": 24,  # Conservative batch size for stability
+                        "chunk_length_s": 30,  # Standard chunk length
+                        "stride_length_s": 3,  # Moderate overlap
+                        "num_workers": min(2, os.cpu_count() or 1)
+                    })
+
+            result = pipe(audio_file, **transcribe_params)
+
+            # Clean up
+            if torch.cuda.is_available():
+                if monitor_thread:
+                    setattr(periodic_monitor, "stop", True)
+                    monitor_thread.join(timeout=1.0)
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            # Remove temporary file
+            if audio_file != str(audio_path):
+                try:
+                    os.unlink(audio_file)
+                except Exception as e:
+                    logger.warning(f"Failed to remove temp file: {e}")
+
+            # Log performance
+            elapsed_time = time.time() - start_time
+            logger.info(f"""
+            ✨ Transcription completed in {elapsed_time:.1f}s
+            Memory peak: {torch.cuda.max_memory_allocated()/1024**2:.0f}MB
+            """)
+
+            return result
+
+        except torch.cuda.OutOfMemoryError as e:
+            last_error = e
+            retry_count += 1
+            if retry_count < max_retries:
+                logger.warning(f"🔄 GPU OOM error, attempt {retry_count}/{max_retries}")
+                torch.cuda.empty_cache()
+                gc.collect()
+                batch_size = max(8, batch_size // 2)
+                time.sleep(1)
+                continue
+            raise RuntimeError(f"GPU memory error after {max_retries} retries") from e
+
+        except (OSError, IOError) as e:
+            last_error = e
+            retry_count += 1
+            if retry_count < max_retries:
+                logger.warning(f"🔄 I/O error, attempt {retry_count}/{max_retries}: {str(e)}")
+                time.sleep(2)
+                continue
+            raise RuntimeError(f"I/O error after {max_retries} retries: {str(e)}") from e
+
+        except Exception as e:
+            logger.error(f"❌ Transcription error: {str(e)}")
+            raise
+
+    raise RuntimeError(f"Failed after {max_retries} attempts. Last error: {str(last_error)}")
 
 def normalize_path(path):
     if not path:
         return path
 
     try:
-        # Behandle Pfade korrekt, auch mit Leerzeichen und Sonderzeichen
+        # Handle paths correctly, including spaces and special characters
         resolved_path = Path(path.strip()).resolve(strict=False)
         return resolved_path
     except Exception as e:
-        st.error(f"Fehler bei der Pfadnormalisierung: {str(e)}")
+        st.error(f"Error normalizing path: {str(e)}")
         return Path(path)
 
-def optimize_gpu_settings():
+def init_gpu_settings():
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
-        torch.cuda.empty_cache()
+        try:
+            # Advanced cleanup and optimization
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.reset_peak_memory_stats()
+            
+            # RTX 4090 optimizations
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.enabled = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cuda.enable_mem_efficient_sdp = True
+            
+            # Get GPU info
+            info = get_gpu_info()
+            if info:
+                st.success(f"GPU: {info['device_name']} | CUDA {info['cuda_version']}")
+                st.info(f"""
+                🚀 RTX 4090 Configuration:
+                
+                💾 Memory:
+                - Total VRAM: {info['total_memory']/1024:.1f} GB
+                - In Use: {info['allocated_memory']/1024:.1f} GB
+                
+                ⚡ Advanced Settings:
+                - Scaled Dot-Product Attention
+                - TF32 Enabled
+                - Mixed Precision (FP16)
+                - Memory Efficient Attention
+                - Large Batch Processing
+                """)
+            
+            return True
+            
+        except Exception as e:
+            st.error(f"GPU setup error: {str(e)}")
+            st.warning("Falling back to CPU processing")
+            return False
 
-def check_gpu_and_model():
+def check_gpu_and_model(get_metrics_func):
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     if torch.cuda.is_available():
-        optimize_gpu_settings()
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-        st.success(f"GPU gefunden: {gpu_name} ({gpu_memory:.2f} GB)")
-        cuda_version = torch.version.cuda
-        st.info(f"CUDA Version: {cuda_version}")
-
-        # Check Flash Attention 2
-        flash_attention_status = torch.backends.cuda.flash_sdp_enabled()
-        flash_attention_message = "aktiviert" if flash_attention_status else "nicht aktiviert"
-        st.info(f"Flash Attention 2 ist {flash_attention_message}")
+        init_gpu_settings()
+        metrics = get_metrics_func()
+        
+        if metrics:
+            st.success(f"GPU: {metrics['device_name']} ({metrics['total_memory']/1024:.1f} GB)")
+            st.info(f"CUDA: {metrics['cuda_version']} | PyTorch: {metrics['torch_version']}")
+            
+            # Display GPU status
+            st.info(f"""
+            GPU Status:
+            💾 Memory: {metrics['allocated_memory']/1024:.1f} GB used / {metrics['total_memory']/1024:.1f} GB total
+            {'⚡ GPU Load: ' + str(int(metrics['utilization'])) + '%' if metrics.get('utilization') is not None else ''}
+            {'🌡️ Temp: ' + str(metrics.get('temperature')) + '°C' if metrics.get('temperature') is not None else ''}
+            """)
+            
+            if torch.backends.cuda.matmul.allow_tf32:
+                st.info("✓ TF32 enabled for better performance")
     else:
-        st.error("Keine GPU gefunden - Transkription läuft auf CPU")
+        st.warning("No GPU found - Transcription running on CPU")
     return device
 
-def extract_audio(video_path):
-    """Extrahiert Audio aus Video oder gibt den Pfad zurück, wenn es bereits eine MP3 ist"""
+def sanitize_filename(filepath):
+    """Cleans the filename and renames if necessary"""
+    try:
+        path = Path(filepath)
+        parent = path.parent
+        stem = path.stem
+        suffix = path.suffix
+        
+        # Remove problematic characters, but keep date and VideoID
+        # Format: YYYY-MM-DD_Title_VideoID.ext
+        parts = stem.split('_')
+        
+        if len(parts) >= 3:  # Expected format
+            date = parts[0]  # YYYY-MM-DD
+            video_id = parts[-1]  # VideoID at end
+            title = '_'.join(parts[1:-1])  # Everything in between is title
+            
+            # Clean only the title
+            clean_title = ''.join(c for c in title if c.isalnum() or c in ' -_.')
+            clean_title = clean_title.strip()
+            
+            # Reassemble filename
+            new_stem = f"{date}_{clean_title}_{video_id}"
+        else:
+            # Fallback: Clean entire name
+            new_stem = ''.join(c for c in stem if c.isalnum() or c in ' -_.')
+            
+        new_name = new_stem + suffix
+        new_path = parent / new_name
+        
+        # Rename if necessary
+        if str(path) != str(new_path):
+            st.info(f"Cleaning filename:\nOld: {path.name}\nNew: {new_path.name}")
+            path.rename(new_path)
+            return new_path
+            
+        return path
+        
+    except Exception as e:
+        st.error(f"Error cleaning filename: {str(e)}")
+        return path  # Return original on error
+
+def find_ffmpeg():
+    """Find ffmpeg executable in PATH or common locations"""
+    # Common Windows locations
+    common_locations = [
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        str(Path.home() / "AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-7.1-full_build/bin/ffmpeg.exe"),
+        str(Path.home() / "AppData/Local/Programs/ffmpeg/bin/ffmpeg.exe")
+    ]
+    
+    # First check PATH
+    from shutil import which
+    ffmpeg_path = which('ffmpeg')
+    if ffmpeg_path:
+        return ffmpeg_path
+    
+    # Then check common locations
+    for loc in common_locations:
+        if Path(loc).exists():
+            return str(Path(loc))
+    
+    raise FileNotFoundError("ffmpeg not found. Please install ffmpeg and add it to PATH.")
+
+def extract_audio(video_path: Path) -> str:
+    """Extract audio from video or return path if it's already an MP3"""
     if str(video_path).lower().endswith('.mp3'):
         return str(video_path)
-        
-    output_path = tempfile.mktemp(suffix='.mp3')
+
+    output_path = None
     try:
-        command = [
-            'ffmpeg', '-i', str(video_path),
-            '-q:a', '0', '-map', 'a',
-            '-af', 'loudnorm=I=-16:LRA=11:TP=-1.5',
-            output_path
-        ]
-        subprocess.run(command, capture_output=True, check=True)
-        return output_path
-    except subprocess.CalledProcessError as e:
-        st.error(f"Fehler bei der Audio-Extraktion: {e.stderr.decode()}")
-        raise
+        # Find ffmpeg
+        ffmpeg_exe = find_ffmpeg()
+        # Prepare input and output paths
+        clean_path = sanitize_filename(video_path)
+        if not clean_path.exists():
+            raise FileNotFoundError(f"File not found: {video_path}")
+        
+        output_path = Path(tempfile.mktemp(suffix='.mp3'))
+        st.info(f"Processing file: {clean_path.name}")
+
+        # Normalize paths for ffmpeg
+        input_path = str(clean_path)
+        if input_path.startswith('\\'):
+            # Network path - convert to forward slashes but keep double backslash at start
+            path_without_prefix = input_path.lstrip('\\')
+            input_path = '//' + path_without_prefix.replace('\\', '/')
+        else:
+            # Local path - convert to forward slashes
+            input_path = input_path.replace('\\', '/')
+
+        # Convert output path to forward slashes
+        output_path_str = str(output_path).replace('\\', '/')
+
+        # Create ffmpeg command string with proper quoting and forward slashes
+        ffmpeg_cmd = f'"{ffmpeg_exe}" -hide_banner -y -i "{input_path}" -q:a 0 -map 0:a -af "loudnorm=I=-16:LRA=11:TP=-1.5" "{output_path_str}"'
+        
+        try:
+            # Run ffmpeg with proper path handling
+            process = subprocess.run(
+                ffmpeg_cmd,
+                shell=True,
+                capture_output=True,
+                check=True,
+                encoding='utf-8',
+                errors='replace',
+                env={
+                    'PYTHONIOENCODING': 'utf-8',
+                    'PATH': os.environ['PATH'],
+                    'SYSTEMROOT': os.environ.get('SYSTEMROOT', '')
+                }
+            )
+            
+            if process.stderr:
+                st.info(f"FFmpeg Output:\n{process.stderr}")
+                
+        except subprocess.CalledProcessError as e:
+            st.error(f"FFmpeg Error (Code {e.returncode}):\n{e.stderr}")
+            if output_path and output_path.exists():
+                output_path.unlink()
+            raise
+
+        # Verify output file
+        if not output_path.exists():
+            raise FileNotFoundError(f"Output file not created: {output_path}")
+        if output_path.stat().st_size == 0:
+            raise ValueError("Output file is empty")
+
+        st.success("Audio extraction successful")
+        return str(output_path)
+
     except Exception as e:
-        st.error(f"Unerwarteter Fehler bei der Audio-Extraktion: {str(e)}")
+        st.error(f"Error in audio extraction: {str(e)}")
+        if output_path and output_path.exists():
+            output_path.unlink()
         raise
+
+def extract_video_id(filename):
+    """Extract YouTube video ID from filename"""
+    base_name = Path(filename).stem
+    parts = base_name.split('_')
+    
+    if not parts:
+        return None
+
+    # Check last part first
+    last_part = parts[-1]
+    if len(last_part) == 11 and is_valid_video_id(last_part):
+        return last_part
+        
+    # Try end of last part
+    if len(last_part) > 11:
+        end_part = last_part[-11:]
+        if is_valid_video_id(end_part):
+            return end_part
+            
+    return None
+
+def is_valid_video_id(candidate):
+    """Validate YouTube video ID format"""
+    return len(candidate) == 11 and bool(re.match(r'^[\w-]{11}$', candidate))
 
 def format_time(seconds):
     hours = int(seconds // 3600)
@@ -91,549 +1055,299 @@ def format_chunk_with_timestamp(chunk):
             start_time = format_time(chunk["timestamp"][0])
             end_time = format_time(chunk["timestamp"][1])
             return f"[{start_time} - {end_time}]\n{chunk['text']}\n\n"
-        return f"[Zeitstempel nicht verfügbar]\n{chunk['text']}\n\n"
+        return f"[Timestamps unavailable]\n{chunk['text']}\n\n"
     except (TypeError, KeyError, AttributeError):
         return f"{chunk.get('text', '')}\n\n"
 
-def transcribe_audio(audio_path, model_name, language, batch_size, chunk_length):
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    try:
-        # Konvertiere Video zu Audio wenn nötig
-        audio_file = extract_audio(audio_path)
-        
-        processor = AutoProcessor.from_pretrained(model_name)
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            use_safetensors=True
-        )
-        
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            torch_dtype=torch.float16,
-        )
-        
-        transcribe_params = {
-            "batch_size": batch_size,
-            "chunk_length_s": chunk_length,
-            "return_timestamps": True,
-            "stride_length_s": chunk_length // 6,
-            "generate_kwargs": {
-                "language": language,
-                "task": "transcribe"
-            }
-        }
-        
-        result = pipe(audio_file, **transcribe_params)
-        
-        # Lösche temporäre Audio-Datei wenn es eine war
-        if audio_file != audio_path:
-            try:
-                os.unlink(audio_file)
-            except Exception as e:
-                st.warning(f"Konnte temporäre Audio-Datei nicht löschen: {str(e)}")
-        
-        return result
-        
-    except Exception as e:
-        st.error(f"Fehler beim Laden des Modells: {str(e)}")
-        raise
-
-def get_video_details(video_id):
-    """Ruft Details eines Videos von der YouTube API ab"""
-    api_key = get_next_api_key()  # Funktion aus app0.py
-    url = f'{BASE_URL}/videos?part=snippet&id={video_id}&key={api_key}'
-    
-    try:
-        response = requests.get(url)
-        data = response.json()
-        
-        if response.status_code == 200 and 'items' in data and len(data['items']) > 0:
-            snippet = data['items'][0]['snippet']
-            # Beschreibung auf 75 Zeichen begrenzen und "..." hinzufügen wenn gekürzt
-            description = snippet.get('description', '')
-            if len(description) > 75:
-                description = description[:72] + "..."
-                
-            return {
-                "channelId": snippet.get('channelId'),
-                "description": description,
-                "thumbnail": snippet.get('thumbnails', {}).get('high', {}).get('url')
-            }
-        elif response.status_code == 403:
-            st.warning(f"API key {api_key} exceeded quota, trying next key...")
-            return get_video_details(video_id)  # Rekursiver Aufruf mit nächstem Key
-        else:
-            st.error(f"Error fetching video details: {data.get('error', {}).get('message', 'Unknown error')}")
-            return None
-    except Exception as e:
-        st.error(f"Error accessing YouTube API: {str(e)}")
-        return {
-            "channelId": None,
-            "description": None,
-            "thumbnail": None
-        }
-
-def save_transcription(file_path, result):
-    """Speichert die Transkription mit Metadaten als einen validen JSON-String"""
-    try:
-        base_path = Path(file_path).with_suffix('')  # Pfad ohne Erweiterung
-        id_file = base_path.with_suffix('.id')
-        txt_file = base_path.with_suffix('.txt')
-        
-        metadata = {}
-        if id_file.exists():
-            # Wenn .id Datei existiert, verwende deren Inhalt
-            try:
-                with open(id_file, 'r', encoding='utf-8') as f:
-                    metadata = json.load(f)
-            except Exception as e:
-                st.warning(f"Konnte Metadaten nicht laden: {str(e)}")
-        else:
-            # Extrahiere Informationen aus dem Dateinamen
-            # Format: YYYY-MM-DD_Title_videoId.ext
-            filename = base_path.name
-            video_id = filename[-11:]  # Letzte 11 Zeichen sind die Video-ID
-            date_str = filename[:10]  # Erste 10 Zeichen sind das Datum
-            title = filename[11:-12]  # Zwischen Datum und Video-ID ist der Titel
-            
-            # Formatiere das Datum
-            try:
-                published_date = datetime.strptime(date_str, '%Y-%m-%d')
-                published_at = published_date.strftime('%Y-%m-%dT00:00:00Z')
-            except:
-                published_at = datetime.now().strftime('%Y-%m-%dT00:00:00Z')
-            
-            # Hole zusätzliche Informationen von der YouTube API
-            api_details = get_video_details(video_id)
-            
-            metadata = {
-                "videoId": video_id,
-                "publishedAt": published_at,
-                "title": title.replace('_', ' '),
-                "channelId": api_details.get('channelId') if api_details else None,
-                "description": api_details.get('description') if api_details else None,
-                "thumbnail": api_details.get('thumbnail') if api_details else None
-            }
-        
-        # Erstelle das Transkript
-        transcript_content = "".join(format_chunk_with_timestamp(chunk) for chunk in result["chunks"])
-        
-        # Kombiniere Metadaten und Transkript in einem JSON-Objekt
-        combined_data = {
-            "videoId": metadata.get("videoId"),
-            "publishedAt": metadata.get("publishedAt"),
-            "channelId": metadata.get("channelId"),
-            "Title": metadata.get("title"),
-            "Description": metadata.get("description"),
-            "thumbnail": metadata.get("thumbnail"),
-            "content": transcript_content
-        }
-        
-        # Speichere als JSON
-        with open(txt_file, 'w', encoding='utf-8') as f:
-            json.dump(combined_data, f, ensure_ascii=False, indent=2)
-        
-        # Lösche .id Datei nach erfolgreicher Verarbeitung
-        if id_file.exists():
-            id_file.unlink()
-            
-    except Exception as e:
-        st.error(f"Fehler beim Speichern der Transkription: {str(e)}")
-
-def process_files(files_to_process, model_name, language, batch_size, chunk_length, auto_save=False, output_dir=None, skip_existing=True):
-    # Entferne mögliche Duplikate und erstelle eine Liste
-    files_to_process = list(dict.fromkeys(files_to_process))
-    total_files = len(files_to_process)
-    
-    results = {}
+def process_files(files_to_process: List[Path], model_name: str, language: str, skip_existing: bool = True) -> dict:
+    """Process multiple files in parallel with GPU acceleration"""
+    # Initialize UI components
+    status_area = st.container()
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
-    # Container für Statusmeldungen
-    with st.expander("Verarbeitungsprotokoll", expanded=False):
-        status_messages = st.container()
-    
-    for idx, file in enumerate(files_to_process):
-        try:
-            file_path = Path(file)
-            status_text.text(f"Verarbeite Datei {idx+1} von {total_files}: {file_path.name}")
-            
-            # Prüfe ob bereits eine TXT-Datei existiert
-            txt_file = file_path.with_suffix('.txt')
-            if skip_existing and txt_file.exists():
-                continue
-                
-            result = transcribe_audio(str(file_path), model_name, language, batch_size, chunk_length)
-            
-            # Speichere Transkription
-            save_transcription(file_path, result)
-            
-            # Statusmeldung in der aufklappbaren Box
-            with status_messages:
-                st.success(f"Transkribiert und gespeichert ({idx+1}/{total_files}): {file_path}")
-            
-            results[file_path.name] = result
-            progress_bar.progress((idx + 1) / total_files)
-            
-        except Exception as e:
-            with status_messages:
-                st.error(f"Fehler bei {file_path.name}: {str(e)}")
-    
-    status_text.text(f"Transkription abgeschlossen! {total_files}/{total_files} Dateien verarbeitet")
-    return results
 
-def show_sidebar_workflow():
-    with st.sidebar:
-        st.header("Automatisierter Workflow")
+    try:
+        # Remove duplicates and filter existing files
+        files_to_process = list(dict.fromkeys(files_to_process))
+        original_count = len(files_to_process)
         
-        # YouTube Einstellungen
-        st.subheader("YouTube Einstellungen")
-        youtube_url = st.text_input('YouTube Channel URL oder ID', key='workflow_yt_url')
-        download_mode = st.radio("Download Modus", ['Date Range', 'Playlist', 'All Videos'], key='workflow_mode')
-        
-        # Date Range Einstellungen wenn ausgewählt
-        if download_mode == 'Date Range':
-            start_date = st.date_input('Start Datum', datetime.now(), key='workflow_start_date')
-            end_date = st.date_input('End Datum', datetime.now() + timedelta(days=1), key='workflow_end_date')
-        
-        # Format und Verzeichnis
-        format_type = st.radio('Download Format', ('mp3', 'mp4'), index=0, key='workflow_format')
-        base_directory = st.text_input('Basis-Verzeichnis', '/mnt/youtube', key='workflow_dir')
-        
-        # Knowledge Base Einstellungen
-        st.subheader("Knowledge Base Einstellungen")
-        project_id = st.text_input('Project ID', value='vc0lgCl8YHKTHQ9ByzYt', key='workflow_project_id')
-        author_name = st.text_input('Author Name', value='', key='workflow_author')
-        
-        # Start Button
-        start_workflow = st.button('Workflow starten')
-        
-        if start_workflow and youtube_url and base_directory:
-            st.session_state.workflow = {
-                'youtube_url': youtube_url,
-                'download_mode': download_mode,
-                'format_type': format_type,
-                'base_directory': base_directory,
-                'project_id': project_id,
-                'author_name': author_name
-            }
-            if download_mode == 'Date Range':
-                st.session_state.workflow.update({
-                    'start_date': start_date,
-                    'end_date': end_date
-                })
+        if skip_existing:
+            files_to_process = [
+                f for f in files_to_process
+                if not f.with_suffix('.txt').exists()
+            ]
+            skipped = original_count - len(files_to_process)
+            if skipped > 0:
+                status_area.info(f"Skipping {skipped} existing files")
 
-def process_workflow():
-    if 'workflow' in st.session_state:
-        workflow = st.session_state.workflow
-        
-        # Fortschrittscontainer in der Sidebar
-        with st.sidebar:
-            st.markdown("---")  # Trennlinie
-            st.subheader("Workflow Fortschritt")
-            download_progress = st.progress(0, "Download")
-            transcribe_progress = st.progress(0, "Transkription")
-            upload_progress = st.progress(0, "Upload")
-            status_text = st.empty()
-            download_counter = st.empty()
-            
-            # 1. Download Videos
-            status_text.text("1/3 Downloading Videos...")
-            from app0 import get_channel_id, get_videos_by_date, get_videos_by_playlist, get_all_videos
-            
-            downloaded_files = []  # Liste für erfolgreich heruntergeladene Dateien
-            videos = []
-            if workflow['youtube_url']:
-                channel_list = get_channel_id(workflow['youtube_url'])
-                if channel_list:
-                    channel_id = channel_list[0]['channelId']
-                    
-                    if workflow['download_mode'] == 'Date Range':
-                        videos = get_videos_by_date(
-                            channel_id, 
-                            workflow['start_date'].strftime('%Y-%m-%d'),
-                            workflow['end_date'].strftime('%Y-%m-%d')
-                        )
-                    elif workflow['download_mode'] == 'Playlist':
-                        videos = get_videos_by_playlist(channel_id)
-                    else:  # All Videos
-                        videos = get_all_videos(channel_id)
-                    
-                    if videos:
-                        st.session_state.videos = videos
-                        # Download der Videos
-                        for i, video in enumerate(videos):
-                            progress = (i + 1) / len(videos)
-                            download_progress.progress(progress)
-                            download_counter.text(f"Downloading: {i + 1} of {len(videos)} videos")
-                            
-                            # Download-Logik
-                            if 'contentDetails' in video:
-                                video_id = video['contentDetails']['videoId']
-                            elif 'id' in video and 'videoId' in video['id']:
-                                video_id = video['id']['videoId']
-                            else:
-                                continue
+        if not files_to_process:
+            status_area.info("No files to process")
+            return {}
 
-                            video_title = video['snippet']['title']
-                            video_date = video['snippet']['publishedAt']
-                            video_url = f'https://www.youtube.com/watch?v={video_id}'
-                            
-                            from app0 import download_video
-                            success = download_video(
-                                video_url, 
-                                video_title, 
-                                video_id, 
-                                video_date, 
-                                workflow['format_type'], 
-                                workflow['base_directory']
-                            )
-                            if success:
-                                downloaded_files.append(Path(workflow['base_directory']) / f"{video_title}_{video_id}.{workflow['format_type']}")
+        status_area.info(f"Processing {len(files_to_process)} files...")
+        results = {}
+        completed = 0
+
+        def safe_status_update(msg_type: str, msg: str) -> None:
+            try:
+                if hasattr(status_area, msg_type):
+                    getattr(status_area, msg_type)(msg)
+            except Exception as e:
+                logger.warning(f"Status update error: {e}")
+
+        # Configure sequential processing (to avoid Streamlit context issues)
+        status_funcs = {
+            "success": lambda msg: safe_status_update("success", msg),
+            "error": lambda msg: safe_status_update("error", msg)
+        }
+
+        # Process files sequentially to avoid threading issues with Streamlit
+        for file in files_to_process:
+            try:
+                success, filename, result = parallel_transcribe_worker(
+                    Path(file),
+                    model_name,
+                    language,
+                    status_funcs
+                )
+                completed += 1
+
+                if success and result:
+                    results[filename] = result
+
+                    # Save transcript
+                    transcript_path = Path(filename).with_suffix('.txt')
+                    with open(transcript_path, 'w', encoding='utf-8') as f:
+                        f.write(result['text'])
+
+                    # Display transcript preview
+                    with status_area.expander(f"📝 Preview: {filename}", expanded=False):
+                        st.text_area("Transcription:", result['text'], height=200, disabled=True)
+
+                progress_bar.progress(completed / len(files_to_process))
+                status_text.text(f"Completed: {completed}/{len(files_to_process)}")
+            except Exception as e:
+                status_area.error(f"Error processing {file}: {str(e)}")
+
+        if completed == len(files_to_process):
+            status_area.success(f"✅ Successfully processed {completed} files")
+        return results
+
+    except Exception as e:
+        status_area.error(f"Processing error: {str(e)}")
+        return {}
+
+def parallel_transcribe_worker(file_path: Path, model_name: str, language: str, status_funcs: dict) -> tuple:
+    """Worker function for parallel processing using TranscriptionManager"""
+    try:
+        # Create manager instance for this worker
+        manager = TranscriptionManager(model_name=model_name, language=language)
+        
+        # Process file
+        result = manager.transcribe(file_path)
+        if result:
+            status_funcs["success"](f"✓ Processed: {file_path.name}")
+            return True, file_path.name, result
             
-            # 2. Transkription
-            status_text.text("2/3 Transkribiere Videos...")
-            
-            # Finde alle neu heruntergeladenen Dateien, die noch keine TXT haben
-            files_to_transcribe = []
-            for media_file in downloaded_files:
-                txt_file = media_file.with_suffix('.txt')
-                if not txt_file.exists():
-                    files_to_transcribe.append(media_file)
-            
-            if files_to_transcribe:
-                model_name = "openai/whisper-large-v3"
-                language = "de"
-                batch_size = 24
-                chunk_length = 30
-                
-                for i, file in enumerate(files_to_transcribe):
-                    progress = (i + 1) / len(files_to_transcribe)
-                    transcribe_progress.progress(progress)
-                    status_text.text(f"Transkribiere: {file.name}")
-                    
-                    try:
-                        result = transcribe_audio(
-                            str(file),
-                            model_name,
-                            language,
-                            batch_size,
-                            chunk_length
-                        )
-                        
-                        # Verwende save_transcription statt direktem Schreiben
-                        save_transcription(file, result)
-                        
-                    except Exception as e:
-                        st.error(f"Fehler bei der Transkription von {file.name}: {str(e)}")
-            else:
-                transcribe_progress.progress(1.0)
-                status_text.text("Keine neuen Dateien zu transkribieren")
-            
-            # 3. Knowledge Base Upload
-            status_text.text("3/3 Upload zur Knowledge Base...")
-            from app2 import upload_file
-            
-            # Finde alle TXT-Dateien der heruntergeladenen Videos
-            files_to_upload = [f.with_suffix('.txt') for f in downloaded_files if f.with_suffix('.txt').exists()]
-            
-            if files_to_upload:
-                for i, file_path in enumerate(files_to_upload):
-                    progress = (i + 1) / len(files_to_upload)
-                    upload_progress.progress(progress)
-                    status_text.text(f"Upload: {file_path.name}")
-                    
-                    try:
-                        metadata = {
-                            "project_id": workflow['project_id'],
-                            "metadata": f'{{"author_name": "{workflow["author_name"]}", "uploaded_by": "workflow", "added_by": "workflow", "category": "transcript", "last_upload": "{datetime.now().strftime("%Y-%m-%d")}"}}'
-                        }
-                        
-                        response = upload_file(file_path, metadata)
-                        if response.status_code != 200:
-                            st.error(f"Fehler beim Upload von {file_path.name}: {response.text}")
-                    except Exception as e:
-                        st.error(f"Fehler beim Upload von {file_path.name}: {str(e)}")
-            else:
-                upload_progress.progress(1.0)
-                status_text.text("Keine Dateien zum Upload")
-            
-            # Workflow-Status zurücksetzen
-            if 'workflow' in st.session_state:
-                del st.session_state.workflow
-            
-            if not files_to_upload:
-                status_text.text("Workflow abgeschlossen! Keine neuen Dateien verarbeitet.")
-            else:
-                status_text.text(f"Workflow abgeschlossen! {len(files_to_upload)} Dateien verarbeitet.")
+        return False, file_path.name, None
+    except Exception as e:
+        status_funcs["error"](f"Error processing {file_path.name}: {str(e)}")
+        return False, file_path.name, None
 
 def show_transcription_tab():
-    st.title("Schnelle Video & Audio Transkription")
-    device = check_gpu_and_model()
+    """Display the transcription interface with enhanced UI and monitoring"""
+    st.title("Fast Video & Audio Transcription")
 
     with st.sidebar:
-        if not 'workflow' in st.session_state:  # Nur anzeigen wenn kein Workflow läuft
-            st.header("Transkriptions-Einstellungen")
+        if 'workflow' not in st.session_state:
+            st.header("📝 Transcription Settings")
             
-            # Sprache zuerst auswählen
-            language = st.selectbox("Sprache", ["de", "en"], index=0)
+            # Language and model selection
+            col1, col2 = st.columns(2)
+            with col1:
+                language = st.selectbox("Language", ["de", "en"], index=0)
+            with col2:
+                mixed_precision = st.checkbox("Mixed Precision", value=True,
+                                         help="Reduces memory usage with minimal quality impact")
             
-            # Modell basierend auf Sprache
-            if language == "de":
-                model_name = st.selectbox(
-                    "Modell",
-                    ["openai/whisper-large-v3", "openai/whisper-large-v2", "openai/whisper-large",
-                     "openai/whisper-large-v3-turbo", "openai/whisper-turbo",
-                     "distil-whisper/distil-large-v2", "distil-whisper/distil-medium.en",
-                     "distil-whisper/distil-small.en", "distil-whisper/distil-large-v3"],
-                    index=0  # Default ist openai/whisper-large-v3
+            # Model selection based on language
+            model_options = {
+                "de": [
+                    "openai/whisper-large-v3",
+                    "openai/whisper-large-v2",
+                    "openai/whisper-large-v3-turbo",
+                    "distil-whisper/distil-large-v2"
+                ],
+                "en": [
+                    "distil-whisper/distil-large-v3",
+                    "openai/whisper-large-v3",
+                    "distil-whisper/distil-large-v2",
+                    "distil-whisper/distil-medium.en"
+                ]
+            }
+            
+            model_name = st.selectbox(
+                "Model",
+                model_options[language],
+                index=0,
+                help="Select model based on your needs (larger models = better quality but slower)"
+            )
+
+            # Get optimized settings based on hardware
+            settings = get_whisper_settings(language)
+            pipeline_settings = settings["pipeline_settings"]
+
+            # Performance settings
+            st.subheader("⚡ Performance Settings")
+            with st.expander("Advanced Settings", expanded=False):
+                # RTX 4090 Preset Selection
+                st.markdown("### 🎯 RTX 4090 Performance Presets")
+                preset = st.selectbox(
+                    "Performance Preset",
+                    ["🛡️ STABIL", "⚡ OPTIMIERT (Empfohlen)", "🚀 SCHNELL (Experimentell)", "🔥 MAX. SCHNELL (Riskant)"],
+                    index=1,  # Default: OPTIMIERT
+                    help="Wählen Sie eine Performance-Einstellung für Ihre RTX 4090"
                 )
-            else:  # language == "en"
-                model_name = st.selectbox(
-                    "Modell",
-                    ["distil-whisper/distil-large-v3", "openai/whisper-large-v3", 
-                     "openai/whisper-large-v2", "openai/whisper-large",
-                     "openai/whisper-large-v3-turbo", "openai/whisper-turbo",
-                     "distil-whisper/distil-large-v2", "distil-whisper/distil-medium.en",
-                     "distil-whisper/distil-small.en"],
-                    index=0  # Default ist distil-whisper/distil-large-v3
+
+                # Apply preset values
+                if preset == "🛡️ STABIL":
+                    batch_val, chunk_val, stride_val, workers_val = 8, 20, 2, 1
+                    help_text = "✨ Maximale Stabilität - Keine Crashes"
+                elif preset == "⚡ OPTIMIERT (Empfohlen)":
+                    batch_val, chunk_val, stride_val, workers_val = 16, 30, 3, 2
+                    help_text = "🎯 Beste Balance - Schnell und zuverlässig"
+                elif preset == "🚀 SCHNELL (Experimentell)":
+                    batch_val, chunk_val, stride_val, workers_val = 32, 45, 5, 4
+                    help_text = "⚡ Höhere Geschwindigkeit - Kann crashen"
+                else:  # MAX. SCHNELL
+                    batch_val, chunk_val, stride_val, workers_val = 56, 60, 8, 6
+                    help_text = "🔥 Maximale Performance - Hoher Crash-Risk"
+
+                st.info(help_text)
+                st.markdown("---")
+
+                # Manual override
+                st.markdown("### 🔧 Manuelles Anpassen")
+                batch_size = st.slider(
+                    "Batch Size", 1, 64, batch_val,
+                    help=f"**RTX 4090 Empfehlung:** {batch_val}\n\nGrößere Batch Size = Schneller, aber mehr RAM/GPU-Speicher"
+                )
+                chunk_length = st.slider(
+                    "Chunk Length (Seconds)", 10, 90, chunk_val,
+                    help=f"**RTX 4090 Empfehlung:** {chunk_val}s\n\nLängere Chunks = Besserer Kontext, aber mehr Speicher"
+                )
+                stride_length = st.slider(
+                    "Stride Length (Seconds)", 1, 10, stride_val,
+                    help=f"**RTX 4090 Empfehlung:** {stride_val}s\n\nÜberlappung zwischen Chunks für bessere Übergänge"
                 )
 
-            batch_size = st.slider("Batch Size", 1, 32, 24)
-            chunk_length = st.slider("Chunk Länge (Sekunden)", 10, 60, 30)
-            auto_save = st.checkbox("Automatisch als TXT speichern", value=True)
-            skip_existing = st.checkbox("Vorhandene ausnehmen", value=True)
+                st.checkbox("Enable dynamic optimization", value=True,
+                          help="Automatically adjust settings based on GPU state")
 
-    folder_paths = st.text_area(
-        "Ordnerpfad(e) eingeben (ein Pfad pro Zeile)", 
-        placeholder="z.B.:\nV:\\AudioFiles\nV:\\VideoFiles",
-        help="Mehrere Pfade können durch Zeilenumbruch getrennt eingegeben werden"
-    )
-    
-    col1, col2, col3 = st.columns([3, 1, 1])
-    with col2:
-        start_transcription = st.button("Transkription starten")
-    with col3:
-        refresh = st.button("🔄 Aktualisieren")
+            # File handling options
+            st.subheader("📁 File Options")
+            auto_save = st.checkbox("Auto-save transcripts", value=True)
+            skip_existing = st.checkbox("Skip existing files", value=True)
 
-    # Container für Status und Debug-Info
-    status_container = st.container()
-    debug_container = st.container()
-    file_selection_container = st.container()
-
-    all_files_to_process = []
-    normalized_paths = []
-
-    with debug_container:
-        if folder_paths:
-            paths = [path.strip() for path in folder_paths.split('\n') if path.strip()]
-            # Liste für alle gefundenen Dateien
-            all_files_to_process = []
-            
-            for path in paths:
-                normalized_path = normalize_path(path)
-                if normalized_path and os.path.exists(normalized_path):
-                    normalized_paths.append(normalized_path)
-                    # Dateien sofort sammeln für korrekte Statusanzeige
-                    if os.path.exists(normalized_path):
-                        available_files = [os.path.join(normalized_path, f) for f in os.listdir(normalized_path) 
-                                         if f.lower().endswith(('.mp4', '.mp3'))]
-                        if skip_existing:
-                            existing_transcriptions = {os.path.splitext(f)[0] 
-                                                    for f in os.listdir(normalized_path) 
-                                                    if f.lower().endswith('.txt')}
-                            new_files = [f for f in available_files 
-                                       if os.path.splitext(os.path.basename(f))[0] not in existing_transcriptions]
-                            all_files_to_process.extend(new_files)
-                        else:
-                            all_files_to_process.extend(available_files)
-
-        # Entferne mögliche Duplikate
-        all_files_to_process = list(dict.fromkeys(all_files_to_process))
-        
-        # Aktualisierte Statusanzeige mit korrekter Anzahl
-        if normalized_paths:
-            status_text = f"""
-            Status:
-            - Start Transcription: {'✅' if start_transcription else '⏸️'}
-            - Gefundene Ordner: {len(normalized_paths)} von {len(paths) if folder_paths else 0}
-            - Dateien zum Transkribieren: {len(all_files_to_process)}
-            - Pfade gültig: ✅
-            """
-        else:
-            status_text = "Bitte geben Sie mindestens einen gültigen Ordnerpfad ein."
-        
-        st.info(status_text)
-
-    with file_selection_container:
-        if folder_paths:
-            for path in normalized_paths:
-                if os.path.exists(path):
-                    # Alle verfügbaren Audio/Video-Dateien finden
-                    available_files = [os.path.join(path, f) for f in os.listdir(path) 
-                                     if f.lower().endswith(('.mp4', '.mp3'))]
-                    
-                    if not skip_existing:
-                        st.write(f"Dateien in {path}:")
-                        selected_files = st.multiselect(
-                            "Dateien auswählen", 
-                            available_files, 
-                            default=available_files,  # Alle Dateien standardmäßig ausgewählt
-                            key=f"files_{path}"
-                        )
-                        all_files_to_process = selected_files  # Aktualisiere die Gesamtliste
+            # GPU Status
+            if gpu.has_gpu:
+                st.subheader("💾 GPU Status")
+                try:
+                    metrics = gpu.get_info()
+                    if metrics:
+                        col1, col2 = st.columns(2)
+                        
+                        # Memory usage in first column
+                        with col1:
+                            if 'total_memory' in metrics and 'allocated_memory' in metrics:
+                                mem_ratio = min(metrics['allocated_memory'] / metrics['total_memory'], 1.0)
+                                st.progress(mem_ratio,
+                                          text=f"{metrics['allocated_memory']:.1f}GB / {metrics['total_memory']:.1f}GB")
+                        
+                        # Temperature and utilization in second column
+                        with col2:
+                            status = []
+                            if 'temperature' in metrics:
+                                status.append(f"🌡️ {metrics['temperature']}°C")
+                            if 'utilization' in metrics:
+                                status.append(f"⚡ {metrics['utilization']}%")
+                            if status:
+                                st.caption(" | ".join(status))
+                        
+                        # GPU info footer
+                        st.caption(f"CUDA {metrics['cuda_version']} | PyTorch {metrics['torch_version']}")
                     else:
-                        # Bereits transkribierte Dateien finden
-                        existing_transcriptions = {os.path.splitext(f)[0] 
-                                                for f in os.listdir(path) 
-                                                if f.lower().endswith('.txt')}
-                        
-                        # Dateien filtern, die noch keine Transkription haben
-                        new_files = [f for f in available_files 
-                                   if os.path.splitext(os.path.basename(f))[0] not in existing_transcriptions]
-                        
-                        if new_files:
-                            st.write(f"Neue Dateien in {path}:")
-                            selected_files = st.multiselect(
-                                "Dateien auswählen", 
-                                new_files, 
-                                default=new_files,  # Alle neuen Dateien standardmäßig ausgewählt
-                                key=f"files_{path}"
-                            )
-                            all_files_to_process.extend(selected_files)
-                        else:
-                            st.info(f"Alle Dateien in {path} wurden bereits transkribiert!")
-                else:
-                    st.error(f"Ordner nicht gefunden: {path}")
+                        st.info("GPU metrics not available")
+                except Exception as e:
+                    logger.warning(f"GPU status error: {e}")
+                    st.warning("Unable to display GPU status")
 
-    with status_container:
-        if start_transcription and all_files_to_process and normalized_paths:
-            # Setze auto_save auf True, um die Transkriptionen zu speichern
-            process_files(all_files_to_process, model_name, language, batch_size, chunk_length, auto_save=True, skip_existing=skip_existing)
+    # File selection interface
+    st.subheader("📂 Select Files")
+    folder_paths = st.text_area(
+        "Enter folder paths (one per line)",
+        placeholder="e.g.:\nC:\\Videos\nD:\\Audio",
+        help="Multiple paths can be separated by line breaks"
+    )
 
-# Hauptanwendung
+    # Action buttons with status
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+    with col2:
+        start_transcription = st.button("🚀 Start", use_container_width=True)
+    with col3:
+        refresh = st.button("🔄 Refresh", use_container_width=True)
+    with col4:
+        clear = st.button("🗑️ Clear", use_container_width=True)
+
+    # Processing status and results
+    status_container = st.container()
+    progress_container = st.container()
+    results_container = st.container()
+
+    if folder_paths and (start_transcription or refresh):
+        with progress_container:
+            paths = [Path(p.strip()) for p in folder_paths.split('\n') if p.strip()]
+            valid_paths = []
+            files_to_process = []
+
+            for path in paths:
+                if path.exists() and path.is_dir():
+                    valid_paths.append(path)
+                    if skip_existing:
+                        existing = set(f.stem for f in path.glob("*.txt"))
+                        new_files = [
+                            f for f in path.glob("*")
+                            if f.suffix.lower() in ('.mp3', '.mp4')
+                            and f.stem not in existing
+                        ]
+                    else:
+                        new_files = [
+                            f for f in path.glob("*")
+                            if f.suffix.lower() in ('.mp3', '.mp4')
+                        ]
+                    files_to_process.extend(new_files)
+
+            if files_to_process:
+                st.info(f"📁 Found {len(files_to_process)} files to process")
+                
+                if start_transcription:
+                    process_files(
+                        files_to_process,
+                        model_name,
+                        language,
+                        skip_existing=skip_existing
+                    )
+            else:
+                st.warning("No files found to process")
+
+# GPU status is handled by GPUManager instance
 def main():
-    # Sidebar für den Workflow
-    show_sidebar_workflow()
-    
-    # Ursprüngliche Tabs bleiben erhalten
-    tab1, tab2, tab3 = st.tabs(["YouTube Download", "Transkription", "Knowledge Base Upload"])
-    
-    with tab1:
-        from app0 import show_youtube_tab
-        show_youtube_tab()
-    
-    with tab2:
+    """Main application entry point"""
+    # Sidebar for workflow
+    if 'workflow' not in st.session_state:
         show_transcription_tab()
-    
-    with tab3:
-        from app2 import show_upload_tab
-        show_upload_tab()
+    else:
+        st.error("Workflow functionality will be implemented in a future update")
 
 if __name__ == "__main__":
     main()

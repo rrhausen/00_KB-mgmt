@@ -20,3 +20,6 @@ env/
 # OS specific
 .DS_Store
 Thumbs.db
+
+# API Keys and sensitive files
+YT_API_keys.txt
