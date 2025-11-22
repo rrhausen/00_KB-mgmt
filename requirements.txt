@@ -1,8 +1,11 @@
 # Core Dependencies
-streamlit>=1.29.0
+streamlit>=1.40.0
 requests>=2.31.0
 tqdm>=4.66.0
-yt-dlp>=2023.12.30
+yt-dlp>=2024.12.0
+
+# Protocol Buffers (critical for streamlit)
+protobuf>=3.20.0,<4.0.0
 
 # ML/AI (PyTorch already installed with CUDA 12.8)
 transformers>=4.36.0
