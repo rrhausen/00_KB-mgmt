@@ -266,6 +266,63 @@ class YouTubeAPI:
         
         return all_videos
 
+    def get_video_details(self, video_id: str) -> dict | None:
+        """
+        Fetch detailed information for a single video.
+
+        Args:
+            video_id: YouTube video ID to fetch details for
+
+        Returns:
+            Dictionary containing video details or None if failed
+            Includes: title, description, channelTitle, publishedAt, thumbnails, etc.
+        """
+        api_key = self.get_next_api_key()
+        url = f'{self.base_url}/videos?key={api_key}&id={video_id}&part=snippet,contentDetails,statistics,status'
+
+        data, status = self.make_request(url)
+        if status == "quota_exceeded":
+            # Try with next key
+            return self.get_video_details(video_id)
+        if status == "error" or not data:
+            return None
+
+        items = data.get('items', [])
+        if not items:
+            return None
+
+        video_item = items[0]
+
+        # Extract video details
+        snippet = video_item.get('snippet', {})
+        content_details = video_item.get('contentDetails', {})
+        statistics = video_item.get('statistics', {})
+        status_info = video_item.get('status', {})
+
+        return {
+            'videoId': video_id,
+            'title': snippet.get('title', ''),
+            'description': snippet.get('description', ''),
+            'channelTitle': snippet.get('channelTitle', ''),
+            'channelId': snippet.get('channelId', ''),
+            'publishedAt': snippet.get('publishedAt', ''),
+            'thumbnails': snippet.get('thumbnails', {}),
+            'tags': snippet.get('tags', []),
+            'categoryId': snippet.get('categoryId', ''),
+            'defaultLanguage': snippet.get('defaultLanguage', ''),
+            'duration': content_details.get('duration', ''),
+            'definition': content_details.get('definition', ''),
+            'caption': content_details.get('caption', ''),
+            'viewCount': statistics.get('viewCount', '0'),
+            'likeCount': statistics.get('likeCount', '0'),
+            'commentCount': statistics.get('commentCount', '0'),
+            'privacyStatus': status_info.get('privacyStatus', ''),
+            'embeddable': status_info.get('embeddable', True),
+            'license': status_info.get('license', ''),
+            'contentRating': content_details.get('contentRating', {}),
+            'regionRestriction': content_details.get('regionRestriction', {})
+        }
+
     def get_channel_id(self, youtube_url: str) -> list:
         """
         Convert various YouTube URL formats to channel ID.
@@ -402,6 +459,19 @@ class YouTubeAPIError(Exception):
 youtube_api = YouTubeAPI()
 BASE_URL = youtube_api.base_url
 
+# Global API Functions
+def get_video_details(video_id: str) -> dict | None:
+    """
+    Global wrapper function for YouTubeAPI.get_video_details()
+
+    Args:
+        video_id: YouTube video ID
+
+    Returns:
+        Video details dictionary or None if failed
+    """
+    return youtube_api.get_video_details(video_id)
+
 # Utility Functions
 def validate_date_format(date_str: str) -> bool:
     """Validates if a string is in RFC 3339 format"""
@@ -522,9 +592,12 @@ def download_video(video_url, video_title, video_id, video_date, format_type, ou
     """
     try:
         # Normalize and create output directory
-        # Ensure proper network path format
+        # Ensure proper path format
         output_dir = output_dir.replace('/', '\\')
-        if not output_dir.startswith('\\\\'):
+
+        # Only add network path prefix for actual network paths
+        # Don't modify Windows drive paths (like V:\folder)
+        if not output_dir.startswith('\\\\') and not (len(output_dir) > 1 and output_dir[1] == ':'):
             if output_dir.startswith('\\'):
                 output_dir = f"\\{output_dir}"
             else:
@@ -721,18 +794,31 @@ def start_download(videos, format, output_dir):
         # Process in detail expander
         with details:
             try:
-                # Extract video information
-                if 'contentDetails' in video:
+                # Extract video information - support multiple structures
+                video_id = None
+                video_title = ""
+                video_date = ""
+
+                # API response structure (flat)
+                if 'videoId' in video:
+                    video_id = video['videoId']
+                    video_title = video.get('title', 'Unknown Title')
+                    video_date = video.get('publishedAt', '')
+                # Playlist/channel structure (nested)
+                elif 'contentDetails' in video:
                     video_id = video['contentDetails']['videoId']
+                    video_title = video['snippet']['title']
+                    video_date = video['snippet']['publishedAt']
+                # Alternative nested structure
                 elif 'id' in video and 'videoId' in video['id']:
                     video_id = video['id']['videoId']
-                else:
+                    video_title = video['snippet']['title']
+                    video_date = video['snippet']['publishedAt']
+
+                if not video_id:
                     st.error("❌ Invalid video format")
                     failed.append("Unknown video format")
                     continue
-
-                video_title = video['snippet']['title']
-                video_date = video['snippet']['publishedAt']
                 video_url = f'https://www.youtube.com/watch?v={video_id}'
 
                 # Show current video status
@@ -797,12 +883,14 @@ def process_video_url(url: str) -> tuple[str | None, dict | None]:
             st.error("❌ Ungültige YouTube URL")
             return None, None
             
-        # Create basic metadata
+        # Create basic metadata matching API structure
         metadata = {
-            'id': {'videoId': video_id},
+            'contentDetails': {'videoId': video_id},
             'snippet': {
                 'title': f'video_{video_id}',
-                'publishedAt': datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')
+                'publishedAt': datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'description': '',
+                'channelTitle': 'Unknown Channel'
             }
         }
         return video_id, metadata
@@ -941,12 +1029,12 @@ def show_youtube_tab():
         )
         download_type = st.session_state.download_type
         
-        if download_type == "Direct URL":
+        if st.session_state.get('download_type') == "Direct URL":
             handle_direct_url(use_api)
             if 'videos' in st.session_state and st.session_state.videos:
                 handle_download_section()
                 
-        elif download_type == "Channel":
+        elif st.session_state.get('download_type') == "Channel":
             youtube_url = st.text_input('Channel URL/ID')
             if youtube_url:
                 channel_list = get_channel_id(youtube_url)
@@ -955,7 +1043,7 @@ def show_youtube_tab():
                     st.success(f"✅ {len(channel_list)} Channel(s) gefunden")
                     handle_download_section()
                     
-        elif download_type == "Playlist":
+        elif st.session_state.get('download_type') == "Playlist":
             st.info("🎵 Playlist-Download")
             playlist_url = st.text_input('Playlist URL')
             if playlist_url:
@@ -1001,7 +1089,7 @@ if not st.session_state.use_youtube_api:
         if video_id:
             st.session_state.videos = [metadata]
 
-elif st.session_state.use_youtube_api and download_type == "Direct URL":
+elif st.session_state.use_youtube_api and st.session_state.get('download_type') == "Direct URL":
     # Direct URL with API features
     video_url = st.text_input(
         'YouTube Video URL eingeben',
@@ -1023,7 +1111,7 @@ elif st.session_state.use_youtube_api and download_type == "Direct URL":
 else:
     video_url = None
 
-    if download_type == "Direct URL":
+    if st.session_state.get('download_type') == "Direct URL":
         video_url = st.text_input('YouTube Video URL eingeben',
                                 placeholder='https://www.youtube.com/watch?v=...')
         
